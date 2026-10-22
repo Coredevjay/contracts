@@ -10,6 +10,13 @@ pub enum Error {
     NothingToWithdraw = 4,
     CooldownActive = 5,
     TooManyRewardTokens = 6,
+    StakeCommitted = 7,
+    CommitmentNotFound = 8,
+    CommitmentExists = 9,
+    ReleaseNotStarted = 10,
+    ReleaseAlreadyStarted = 11,
+    IncidentAlreadySlashed = 12,
+    SlashExceedsCommitment = 13,
     // Schema migrations (zenith_common::migrations) — same codes in
     // every Zenith contract. See docs/migrations.md.
     SchemaVersionMismatch = 100,

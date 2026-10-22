@@ -3,7 +3,7 @@
 use crate::{Staking, StakingClient};
 use soroban_sdk::{
     testutils::{Address as _, Ledger as _},
-    token, Address, Env,
+    token, Address, BytesN, Env, Symbol,
 };
 
 const COOLDOWN: u64 = 7 * 86_400;
@@ -215,4 +215,87 @@ fn prop_no_staker_claims_more_than_share() {
         assert!(accounted <= notified);
         assert!(h.usdc.balance(&h.client.address) >= notified - accounted);
     }
+}
+
+// ── Commitments & slashing ──────────────────────────────────────────────────
+
+fn id(env: &Env, n: u8) -> BytesN<32> {
+    BytesN::from_array(env, &[n; 32])
+}
+
+fn committed_staker(h: &Harness, amount: i128, committed: i128) -> (Address, Address, BytesN<32>) {
+    let user = h.staker(amount);
+    let committer = Address::generate(&h.env);
+    let key = id(&h.env, 1);
+    h.client.commit(&user, &committer, &key, &committed);
+    (user, committer, key)
+}
+
+#[test]
+fn committed_stake_cannot_be_unstaked() {
+    let h = setup();
+    let (user, _, _) = committed_staker(&h, 1_000, 600);
+    assert_eq!(h.client.get_committed(&user), 600);
+    h.client.request_unstake(&user, &400);
+    assert!(h.client.try_request_unstake(&user, &1).is_err());
+}
+
+#[test]
+fn release_requires_cooldown_and_is_permissionless() {
+    let h = setup();
+    let (user, committer, key) = committed_staker(&h, 1_000, 600);
+    assert!(h
+        .client
+        .try_finalize_release(&user, &committer, &key)
+        .is_err());
+    h.client.start_release(&user, &committer, &key);
+    assert!(h
+        .client
+        .try_finalize_release(&user, &committer, &key)
+        .is_err());
+    h.env.ledger().with_mut(|l| l.timestamp += COOLDOWN);
+    h.client.finalize_release(&user, &committer, &key);
+    assert_eq!(h.client.get_committed(&user), 0);
+    h.client.request_unstake(&user, &1_000);
+}
+
+#[test]
+fn slash_hits_unbonding_before_active_stake() {
+    let h = setup();
+    let (user, committer, key) = committed_staker(&h, 1_000, 500);
+    h.client.request_unstake(&user, &300);
+    let to = Address::generate(&h.env);
+    h.client.slash(
+        &user,
+        &committer,
+        &key,
+        &id(&h.env, 9),
+        &400,
+        &Symbol::new(&h.env, "bad"),
+        &to,
+    );
+    // 300 came out of unbonding, 100 out of active stake (700 -> 600).
+    assert_eq!(h.zen.balance(&to), 400);
+    assert_eq!(h.client.get_committed(&user), 100);
+    h.env.ledger().with_mut(|l| l.timestamp += COOLDOWN);
+    assert!(h.client.try_withdraw(&user).is_err());
+    h.client.request_unstake(&user, &500);
+}
+
+#[test]
+fn double_slash_and_over_slash_are_rejected() {
+    let h = setup();
+    let (user, committer, key) = committed_staker(&h, 1_000, 500);
+    let to = Address::generate(&h.env);
+    let r = Symbol::new(&h.env, "bad");
+    let inc = id(&h.env, 9);
+    assert!(h
+        .client
+        .try_slash(&user, &committer, &key, &inc, &501, &r, &to)
+        .is_err());
+    h.client.slash(&user, &committer, &key, &inc, &100, &r, &to);
+    assert!(h
+        .client
+        .try_slash(&user, &committer, &key, &inc, &100, &r, &to)
+        .is_err());
 }

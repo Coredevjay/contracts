@@ -113,7 +113,9 @@ fn stale_schema_blocks_guarded_entrypoints() {
     client.init(&1);
     assert_eq!(
         client.try_guarded(),
-        Err(Ok(HarnessError::MigrationInProgress))
+        Err(Ok(soroban_sdk::Error::from_contract_error(
+            HarnessError::MigrationInProgress as u32
+        )))
     );
 }
 
@@ -131,30 +133,42 @@ fn paginated_migration_runs_every_step_once_in_order() {
     assert_eq!(client.processed(), migrations::DEFAULT_MIGRATION_BATCH);
     assert_eq!(
         client.try_guarded(),
-        Err(Ok(HarnessError::MigrationInProgress))
+        Err(Ok(soroban_sdk::Error::from_contract_error(
+            HarnessError::MigrationInProgress as u32
+        )))
     );
 
     // `migrate` can't be re-entered while a batch is in flight.
     assert_eq!(
         client.try_migrate(&2, &3),
-        Err(Ok(HarnessError::MigrationInProgress))
+        Err(Ok(soroban_sdk::Error::from_contract_error(
+            HarnessError::MigrationInProgress as u32
+        )))
     );
     // Replaying or skipping pages is rejected, as are bad limits.
     assert_eq!(
         client.try_migrate_batch(&0, &50),
-        Err(Ok(HarnessError::InvalidMigrationBatch))
+        Err(Ok(soroban_sdk::Error::from_contract_error(
+            HarnessError::InvalidMigrationBatch as u32
+        )))
     );
     assert_eq!(
         client.try_migrate_batch(&100, &50),
-        Err(Ok(HarnessError::InvalidMigrationBatch))
+        Err(Ok(soroban_sdk::Error::from_contract_error(
+            HarnessError::InvalidMigrationBatch as u32
+        )))
     );
     assert_eq!(
         client.try_migrate_batch(&50, &0),
-        Err(Ok(HarnessError::InvalidMigrationBatch))
+        Err(Ok(soroban_sdk::Error::from_contract_error(
+            HarnessError::InvalidMigrationBatch as u32
+        )))
     );
     assert_eq!(
         client.try_migrate_batch(&50, &(migrations::MAX_MIGRATION_BATCH + 1)),
-        Err(Ok(HarnessError::InvalidMigrationBatch))
+        Err(Ok(soroban_sdk::Error::from_contract_error(
+            HarnessError::InvalidMigrationBatch as u32
+        )))
     );
 
     assert_eq!(client.migrate_batch(&50, &40), 2);
@@ -166,7 +180,9 @@ fn paginated_migration_runs_every_step_once_in_order() {
 
     assert_eq!(
         client.try_migrate_batch(&0, &50),
-        Err(Ok(HarnessError::NoMigrationInProgress))
+        Err(Ok(soroban_sdk::Error::from_contract_error(
+            HarnessError::NoMigrationInProgress as u32
+        )))
     );
 }
 
@@ -178,22 +194,93 @@ fn rejects_repeating_or_skipping_steps() {
     // `from` must be the stored version.
     assert_eq!(
         client.try_migrate(&2, &3),
-        Err(Ok(HarnessError::SchemaVersionMismatch))
+        Err(Ok(soroban_sdk::Error::from_contract_error(
+            HarnessError::SchemaVersionMismatch as u32
+        )))
     );
     // Target must be ahead of `from` and known to this wasm.
     assert_eq!(
         client.try_migrate(&1, &1),
-        Err(Ok(HarnessError::InvalidMigrationTarget))
+        Err(Ok(soroban_sdk::Error::from_contract_error(
+            HarnessError::InvalidMigrationTarget as u32
+        )))
     );
     assert_eq!(
         client.try_migrate(&1, &4),
-        Err(Ok(HarnessError::InvalidMigrationTarget))
+        Err(Ok(soroban_sdk::Error::from_contract_error(
+            HarnessError::InvalidMigrationTarget as u32
+        )))
     );
 
     assert_eq!(client.migrate(&1, &2), 2);
     // Step 2 already ran: repeating it fails.
     assert_eq!(
         client.try_migrate(&1, &2),
-        Err(Ok(HarnessError::SchemaVersionMismatch))
+        Err(Ok(soroban_sdk::Error::from_contract_error(
+            HarnessError::SchemaVersionMismatch as u32
+        )))
     );
+}
+
+mod guard_tests {
+    use crate::guard;
+    use soroban_sdk::{contract, contracterror, contractimpl, symbol_short, Env, Symbol};
+
+    #[contracterror]
+    #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+    #[repr(u32)]
+    pub enum GuardError {
+        Reentered = 200,
+    }
+
+    const KEY: Symbol = symbol_short!("guard");
+
+    #[contract]
+    pub struct G;
+
+    #[contractimpl]
+    impl G {
+        pub fn run(env: Env, reenter: bool) -> bool {
+            guard::with_guard(&env, &KEY, GuardError::Reentered, || {
+                if reenter {
+                    Self::run(env.clone(), false);
+                }
+                true
+            })
+        }
+
+        pub fn held(env: Env) -> bool {
+            guard::is_entered(&env, &KEY)
+        }
+
+        pub fn early(env: Env) -> u32 {
+            guard::with_guard(&env, &KEY, GuardError::Reentered, || {
+                return 7;
+            })
+        }
+    }
+
+    #[test]
+    fn released_after_normal_and_early_return() {
+        let env = Env::default();
+        let c = GClient::new(&env, &env.register_contract(None, G));
+        assert!(c.run(&false));
+        assert!(!c.held());
+        assert_eq!(c.early(), 7);
+        assert!(!c.held());
+        assert!(c.run(&false));
+    }
+
+    #[test]
+    fn reentry_is_rejected() {
+        let env = Env::default();
+        let c = GClient::new(&env, &env.register_contract(None, G));
+        assert_eq!(
+            c.try_run(&true),
+            Err(Ok(soroban_sdk::Error::from_contract_error(200)))
+        );
+        // The failed invocation rolled back, so the guard is free again.
+        assert!(!c.held());
+        assert!(c.run(&false));
+    }
 }

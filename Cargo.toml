@@ -17,6 +17,7 @@ members = [
     "streams",
     "timelock",
     "vault",
+    "tools/feeder",
     "tools/spec-diff",
     "xtask",
 ]

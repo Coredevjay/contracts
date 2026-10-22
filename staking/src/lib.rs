@@ -17,7 +17,9 @@
 //! Unstaking is two-step: `request_unstake` stops the amount earning
 //! immediately and starts the cooldown; `withdraw` returns it afterward.
 
-use soroban_sdk::{contract, contractimpl, panic_with_error, token, Address, Env, Vec};
+use soroban_sdk::{
+    contract, contractimpl, panic_with_error, token, Address, BytesN, Env, Symbol, Vec,
+};
 
 #[cfg(test)]
 mod test;
@@ -29,7 +31,7 @@ mod types;
 
 use error::Error;
 pub use migrations::CURRENT_SCHEMA_VERSION;
-use types::{DataKey, PendingUnstake};
+use types::{Commitment, DataKey, PendingUnstake};
 
 /// Scale of RewardPerToken. 1e18 keeps a 1-base-unit reward over a
 /// 1e15-unit total stake (1e8 tokens at 7 decimals) representable, while
@@ -162,6 +164,10 @@ impl Staking {
         if amount > stake {
             panic_with_error!(&env, Error::InsufficientStake);
         }
+        // Stake backing a committed slot is locked until released.
+        if stake - amount < get_i128(&env, &DataKey::Committed(user.clone())) {
+            panic_with_error!(&env, Error::StakeCommitted);
+        }
         update_user(&env, &user);
         set_i128(&env, &key, stake - amount);
         env.storage()
@@ -253,6 +259,163 @@ impl Staking {
         );
         distribute(&env, &token, amount);
         events::reward_notified(&env, token, amount);
+    }
+
+    // ── Commitments & slashing (price_oracle feeder bonds) ──────────────────
+    //
+    // A committer contract (the oracle) locks part of a user's active stake
+    // under an opaque `(committer, key)` slot. Locked stake cannot be passed
+    // to `request_unstake`. Releasing is two-step: the committer starts it
+    // (feeder removal/rotation), and once the cooldown has elapsed anyone
+    // can `finalize_release`. Until then the commitment stays slashable.
+
+    /// Locks `amount` of `user`'s uncommitted active stake for `committer`/`key`.
+    pub fn commit(env: Env, user: Address, committer: Address, key: BytesN<32>, amount: i128) {
+        user.require_auth();
+        committer.require_auth();
+        migrations::require_current(&env);
+        if amount <= 0 {
+            panic_with_error!(&env, Error::InvalidAmount);
+        }
+        let ckey = DataKey::Commitment(user.clone(), committer.clone(), key);
+        if env.storage().persistent().has(&ckey) {
+            panic_with_error!(&env, Error::CommitmentExists);
+        }
+        let total_key = DataKey::Committed(user.clone());
+        let committed = get_i128(&env, &total_key) + amount;
+        if committed > get_i128(&env, &DataKey::Stake(user.clone())) {
+            panic_with_error!(&env, Error::InsufficientStake);
+        }
+        set_i128(&env, &total_key, committed);
+        env.storage().persistent().set(
+            &ckey,
+            &Commitment {
+                amount,
+                release_at: 0,
+            },
+        );
+        events::committed(&env, user, committer, amount);
+    }
+
+    /// Committer-only: begins the cooldown after which the commitment can be finalized.
+    pub fn start_release(env: Env, user: Address, committer: Address, key: BytesN<32>) {
+        committer.require_auth();
+        migrations::require_current(&env);
+        let ckey = DataKey::Commitment(user.clone(), committer.clone(), key);
+        let mut c: Commitment = env
+            .storage()
+            .persistent()
+            .get(&ckey)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::CommitmentNotFound));
+        if c.release_at != 0 {
+            panic_with_error!(&env, Error::ReleaseAlreadyStarted);
+        }
+        let cooldown: u64 = env.storage().instance().get(&DataKey::Cooldown).unwrap();
+        c.release_at = env.ledger().timestamp() + cooldown;
+        env.storage().persistent().set(&ckey, &c);
+        events::release_started(&env, user, committer, c.release_at);
+    }
+
+    /// Permissionless: unlocks the commitment once its cooldown has elapsed.
+    pub fn finalize_release(env: Env, user: Address, committer: Address, key: BytesN<32>) {
+        migrations::require_current(&env);
+        let ckey = DataKey::Commitment(user.clone(), committer.clone(), key);
+        let c: Commitment = env
+            .storage()
+            .persistent()
+            .get(&ckey)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::CommitmentNotFound));
+        if c.release_at == 0 {
+            panic_with_error!(&env, Error::ReleaseNotStarted);
+        }
+        if env.ledger().timestamp() < c.release_at {
+            panic_with_error!(&env, Error::CooldownActive);
+        }
+        env.storage().persistent().remove(&ckey);
+        let total_key = DataKey::Committed(user.clone());
+        set_i128(&env, &total_key, get_i128(&env, &total_key) - c.amount);
+        events::released(&env, user, committer, c.amount);
+    }
+
+    /// Committer-only. Slashes `amount` (never more than the commitment —
+    /// over-slashing is rejected, not clamped) from `user`: first from
+    /// stake already unbonding, then from active stake. Each `incident`
+    /// can be slashed once per committer. Slashed tokens go to `recipient`.
+    pub fn slash(
+        env: Env,
+        user: Address,
+        committer: Address,
+        key: BytesN<32>,
+        incident: BytesN<32>,
+        amount: i128,
+        reason: Symbol,
+        recipient: Address,
+    ) {
+        committer.require_auth();
+        migrations::require_current(&env);
+        if amount <= 0 {
+            panic_with_error!(&env, Error::InvalidAmount);
+        }
+        let ckey = DataKey::Commitment(user.clone(), committer.clone(), key);
+        let mut c: Commitment = env
+            .storage()
+            .persistent()
+            .get(&ckey)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::CommitmentNotFound));
+        if amount > c.amount {
+            panic_with_error!(&env, Error::SlashExceedsCommitment);
+        }
+        let incident_key = DataKey::Slashed(committer.clone(), incident);
+        if env.storage().persistent().has(&incident_key) {
+            panic_with_error!(&env, Error::IncidentAlreadySlashed);
+        }
+        env.storage().persistent().set(&incident_key, &true);
+
+        // Effects first: unbonding, then active stake.
+        let pending_key = DataKey::PendingUnstake(user.clone());
+        let mut from_unbonding = 0;
+        if let Some(mut p) = env
+            .storage()
+            .persistent()
+            .get::<_, PendingUnstake>(&pending_key)
+        {
+            from_unbonding = amount.min(p.amount);
+            p.amount -= from_unbonding;
+            if p.amount == 0 {
+                env.storage().persistent().remove(&pending_key);
+            } else {
+                env.storage().persistent().set(&pending_key, &p);
+            }
+        }
+        let from_stake = amount - from_unbonding;
+        if from_stake > 0 {
+            update_user(&env, &user);
+            let skey = DataKey::Stake(user.clone());
+            set_i128(&env, &skey, get_i128(&env, &skey) - from_stake);
+            env.storage()
+                .instance()
+                .set(&DataKey::TotalStaked, &(total_staked(&env) - from_stake));
+        }
+        c.amount -= amount;
+        let total_key = DataKey::Committed(user.clone());
+        set_i128(&env, &total_key, get_i128(&env, &total_key) - amount);
+        if c.amount == 0 {
+            env.storage().persistent().remove(&ckey);
+        } else {
+            env.storage().persistent().set(&ckey, &c);
+        }
+
+        let stake_token: Address = env.storage().instance().get(&DataKey::StakeToken).unwrap();
+        token::Client::new(&env, &stake_token).transfer(
+            &env.current_contract_address(),
+            &recipient,
+            &amount,
+        );
+        events::slashed(&env, user, committer, reason, amount, from_unbonding);
+    }
+
+    pub fn get_committed(env: Env, user: Address) -> i128 {
+        get_i128(&env, &DataKey::Committed(user))
     }
 
     // ── Schema migrations (docs/migrations.md) ──────────────────────────────
